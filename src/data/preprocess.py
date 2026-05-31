@@ -72,11 +72,11 @@ class data(Dataset):
   
 def get_dataloaders():
     train_data = data(train_inputs,train_labels)
-    test_data = data(test_inputs,test_labels)
+    test_data = data(test_inputs,valid_labels)
     valid_data = data(valid_inputs,valid_labels)
 
-    train_loader = DataLoader(train_data,batch_size=64,shuffle=True)
-    test_loader = DataLoader(test_data,batch_size=64,shuffle=True)
-    valid_loader = DataLoader(valid_data,batch_size=64,shuffle=True)
+    train_loader = Dataloader(train_data,batch_size=64,shuffle=True)
+    test_loader = Dataloader(test_data,batch_size=64,shuffle=True)
+    valid_loader = Dataloader(valid_data,batch_size=64,shuffle=True)
 
-    return train_loader,test_loader,valid_loader,vocab
+    return train_loader,test_loader,valid_loader,vocab 
