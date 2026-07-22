@@ -37,7 +37,7 @@ def objective(trial):
 
       model.train()
 
-      loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+      loop = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
 
       for input_ids, labels in loop:
           input_ids = input_ids.to(device)
@@ -59,7 +59,7 @@ def objective(trial):
           loop.set_postfix(loss=loss.item(), acc=acc.item())
 
       print(
-          f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Acc: {total_acc/len(train_loader):.4f}"
+          f"Epoch {epoch+1} | Loss: {total_loss/len(valid_loader):.4f} | Acc: {total_acc/len(valid_loader):.4f}"
       )
 
   # evaluation
@@ -67,7 +67,7 @@ def objective(trial):
   total_loss = 0
   accuracy = 0
   with torch.no_grad():
-      for input_ids, labels in test_loader:
+      for input_ids, labels in valid_loader:
           input_ids = input_ids.to(device)
           labels = labels.to(device)
 
@@ -77,7 +77,7 @@ def objective(trial):
           total_loss += batch_loss.item()
           accuracy += batch_accuracy.item()
       print(
-          f"Test loss is {total_loss/len(test_loader):.4f} and accuracy is {accuracy/len(test_loader):.4f}"
+          f"Test loss is {total_loss/len(valid_loader):.4f} and accuracy is {accuracy/len(valid_loader):.4f}"
       )
 
-  return total_loss/len(test_loader)
+  return total_loss/len(valid_loader)
