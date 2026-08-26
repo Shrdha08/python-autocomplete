@@ -1,0 +1,11 @@
+# Generated pipeline artifacts: encoded splits, vocabulary, checkpoints.
+artifacts/
+*.pkl
+*.pt
+
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+.ipynb_checkpoints/

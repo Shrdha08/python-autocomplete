@@ -153,20 +153,19 @@ reproducible for anyone reading the repository.
 
 ```
 notebooks/
-  01_data_encoding.ipynb                tokenization, split, vocabulary, encoding
+  01_data_encoding.ipynb                 tokenization, split, vocabulary, encoding
   02_chunking_dataset_preparation.ipynb  windowing into context/target pairs
   03_lstm_model_.ipynb                   seq2seq model, Optuna tuning, training, eval
 src/
-  data/preprocess.py                     earlier single-token pipeline (see note)
-  models/lstm_model.py                   earlier Optuna objective (see note)
+  data/preprocess.py                     tokenize, split, vocab, dataset, dataloaders
+  models/lstm_model.py                   encoder, decoder, seq2seq, greedy completion
+  train.py                               training loop, Optuna tuning, evaluation
 ```
 
-> **Note on `src/`.** The notebooks are the current, working pipeline. The files
-> under `src/` are an earlier extraction from a previous iteration that predicted
-> a *single* next token from a 10-token window, using a different vocabulary
-> convention (`<pad>`/`<unk>`). They have drifted from the notebooks and do not
-> run as-is. Treat the notebooks as canonical until `src/` is regenerated from
-> them.
+The notebooks are the exploratory record; `src/` is the same pipeline as
+runnable modules. Import-time side effects were removed, so importing
+`preprocess` no longer downloads the dataset — call `build_and_cache()` once,
+then `get_dataloaders()`.
 
 ---
 
@@ -176,9 +175,20 @@ src/
 pip install torch datasets scikit-learn optuna matplotlib tqdm
 ```
 
-Run the notebooks in order — `01` → `02` → `03`. Stage 01 downloads the dataset
-from the Hugging Face Hub and writes `vocab.pkl` plus the encoded splits; later
-stages load those artifacts.
+Run the pipeline from `src/`:
+
+```bash
+python -m src.data.preprocess          # tokenize + encode -> artifacts/
+python -m src.train tune --trials 10   # Optuna search -> artifacts/best_params.json
+python -m src.train train --epochs 20  # train, checkpoint, report test metrics
+```
+
+`preprocess` accepts `--limit N` to tokenize only the first N functions, which
+is useful for a quick end-to-end check before committing to the full corpus.
+
+Alternatively, run the notebooks in order — `01` → `02` → `03`. Stage 01
+downloads the dataset from the Hugging Face Hub and writes `vocab.pkl` plus the
+encoded splits; later stages load those artifacts.
 
 A GPU is recommended. The model moves to CUDA when available and falls back to
 CPU, but the vocabulary is large enough (up to 50,004 entries) that the decoder's
@@ -203,7 +213,8 @@ generated artifacts (`.pkl` files, checkpoints) are not committed.
 - [x] Chunked dataset and dataloaders
 - [x] Seq2seq LSTM model
 - [x] Optuna hyperparameter tuning
+- [x] Runnable `src/` modules matching the notebook pipeline
+- [x] Greedy completion (`Seq2Seq.complete`)
 - [ ] Record and commit final metrics
-- [ ] Inference module for top-k completions
-- [ ] Beam search decoding
-- [ ] Regenerate `src/` from the notebook pipeline
+- [ ] Top-k / beam search decoding
+- [ ] Decode generated token ids back to formatted source
