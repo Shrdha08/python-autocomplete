@@ -1,82 +1,301 @@
-from datasets import load_dataset
-from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset,DataLoader
-import torch 
+"""Data pipeline for the Python code-completion model.
 
-# loading dataset
-ds = load_dataset("Nan-Do/code-search-net-python")
+Mirrors notebooks 01 and 02: tokenize CodeSearchNet Python source, strip
+comments and docstrings, build a vocabulary from the training split only,
+encode to integer IDs, and window each function into
+(context -> rest-of-line) pairs for the seq2seq model.
 
-# using tokenised text
-code_tokens=[]
+Nothing runs at import time; call `build_and_cache()` once to produce the
+artifacts, then `get_dataloaders()` to consume them.
+"""
+from __future__ import annotations
 
-for token_list in ds['train']['code_tokens']:
-  code_tokens.append(token_list)
-
-# train-test split to split data
-# train - 80%
-# test - 10%
-# valid - 10%
-train_data,temp_data=train_test_split(code_tokens,test_size=0.2,random_state=42)
-test_data,valid_data=train_test_split(temp_data,test_size=0.5,random_state=42)
-
-# build vocab of max 50000 most common words
-vocab={}
+import io
+import pickle
+import tokenize
 from collections import Counter
-vocab['<pad>']=0
-vocab['<unk>']=1
+from pathlib import Path
 
-counter=Counter()
-for token_list in train_data:
-  counter.update(token for token in token_list)
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
 
-for token,freq in counter.most_common(50000):
-  if freq>=2:
-    vocab[token]=len(vocab)
+DATASET_NAME = "Nan-Do/code-search-net-python"
+ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts"
 
-def encode(token_list):
-  return [vocab[token] if token in vocab else vocab['unk'] for token in token_list]
+SEQ_LENGTH = 32
+STRIDE = 16
+MAX_OUTPUT_LENGTH = 50
+MAX_VOCAB_SIZE = 50_000
+MIN_TOKEN_FREQ = 2
+BATCH_SIZE = 64
+RANDOM_STATE = 42
 
-mapped_train_tokens=[encode(token_list) for token_list in train_data]
-mapped_test_tokens=[encode(token_list) for token_list in test_data]
-mapped_valid_tokens=[encode(token_list) for token_list in valid_data]
+# `<NEWLINE>`, `<INDENT>` and `<DEDENT>` are emitted by tokenize_code() as
+# literal tokens. They are registered explicitly rather than being left to the
+# frequency cutoff, because the dataset windowing depends on `<NEWLINE>` being
+# present in the vocabulary.
+SPECIAL_TOKENS = (
+    "<PAD>",
+    "<UNK>",
+    "<BOS>",
+    "<EOS>",
+    "<NEWLINE>",
+    "<INDENT>",
+    "<DEDENT>",
+)
 
-# generating training data
-def data_prep(mapped_tokens):
-  inputs=[]
-  target=[]
 
-  seq_len=10
+def tokenize_code(source: str) -> list[str] | None:
+    """Tokenize Python source, dropping comments and docstrings.
 
-  for token_list in mapped_tokens:
-    for i in range(seq_len,len(token_list)):
-      inputs.append(token_list[i-seq_len:i])
-      target.append(token_list[i])
+    Returns None for sources that cannot be tokenized.
+    """
+    tokens: list[str] = []
+    prev_toktype = tokenize.INDENT
 
-  return inputs,target
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            tok_type, tok_str = tok.type, tok.string
 
-train_inputs,train_labels=data_prep(mapped_train_tokens)
-test_inputs,test_labels=data_prep(mapped_test_tokens)
-valid_inputs,valid_labels=data_prep(mapped_valid_tokens)
+            if tok_type == tokenize.COMMENT:
+                continue
 
-class data(Dataset):
-  def __init__(self,X,y):
-    super().__init__()
-    self.X=X
-    self.y=y
+            # A string in statement position is a docstring, not a value.
+            if tok_type == tokenize.STRING and prev_toktype in (
+                tokenize.INDENT,
+                tokenize.NEWLINE,
+                tokenize.DEDENT,
+            ):
+                prev_toktype = tok_type
+                continue
 
-  def __len__(self):
-    return len(self.X)
+            if tok_type == tokenize.INDENT:
+                tokens.append("<INDENT>")
+            elif tok_type == tokenize.DEDENT:
+                tokens.append("<DEDENT>")
+            elif tok_type in (tokenize.NEWLINE, tokenize.NL):
+                tokens.append("<NEWLINE>")
+            else:
+                tokens.append(tok_str)
 
-  def __getitem__(self,index):
-    return torch.tensor(self.X[index]),torch.tensor(self.y[index])
-  
-def get_dataloaders():
-    train_data = data(train_inputs,train_labels)
-    test_data = data(test_inputs,valid_labels)
-    valid_data = data(valid_inputs,valid_labels)
+            prev_toktype = tok_type
 
-    train_loader = Dataloader(train_data,batch_size=64,shuffle=True)
-    test_loader = Dataloader(test_data,batch_size=64,shuffle=True)
-    valid_loader = Dataloader(valid_data,batch_size=64,shuffle=True)
+        return tokens
 
-    return train_loader,test_loader,valid_loader,vocab 
+    except (IndentationError, tokenize.TokenError, TabError, SyntaxError):
+        return None
+
+
+def load_code_tokens(limit: int | None = None) -> list[list[str]]:
+    """Download CodeSearchNet Python and tokenize every function."""
+    from datasets import load_dataset
+
+    ds = load_dataset(DATASET_NAME)
+    sources = ds["train"]["code"]
+    if limit is not None:
+        sources = sources[:limit]
+
+    code_tokens = []
+    for source in sources:
+        tokens = tokenize_code(source)
+        if tokens:
+            code_tokens.append(tokens)
+    return code_tokens
+
+
+def split_data(
+    code_tokens: list[list[str]],
+) -> tuple[list[list[str]], list[list[str]], list[list[str]]]:
+    """Split 80/10/10 into train, validation, test."""
+    from sklearn.model_selection import train_test_split
+
+    train_data, temp_data = train_test_split(
+        code_tokens, test_size=0.2, random_state=RANDOM_STATE
+    )
+    valid_data, test_data = train_test_split(
+        temp_data, test_size=0.5, random_state=RANDOM_STATE
+    )
+    return train_data, valid_data, test_data
+
+
+def build_vocab(train_data: list[list[str]]) -> dict[str, int]:
+    """Build the vocabulary from the training split only, to avoid leakage."""
+    vocab = {token: idx for idx, token in enumerate(SPECIAL_TOKENS)}
+
+    counter: Counter[str] = Counter()
+    for token_list in train_data:
+        counter.update(token_list)
+
+    for token, freq in counter.most_common(MAX_VOCAB_SIZE):
+        if freq >= MIN_TOKEN_FREQ and token not in vocab:
+            vocab[token] = len(vocab)
+
+    return vocab
+
+
+def encode(token_list: list[str], vocab: dict[str, int]) -> list[int]:
+    unk = vocab["<UNK>"]
+    return [vocab.get(token, unk) for token in token_list]
+
+
+class CodeCompletionDataset(Dataset):
+    """Windows encoded functions into (context -> rest-of-line) examples.
+
+    For each split point, the encoder sees the preceding `seq_length` tokens and
+    the decoder is supervised on the tokens up to the next `<NEWLINE>` (capped at
+    `max_output_length`), so the model learns to finish one logical line.
+    """
+
+    def __init__(
+        self,
+        data: list[list[int]],
+        vocab: dict[str, int],
+        seq_length: int = SEQ_LENGTH,
+        max_output_length: int = MAX_OUTPUT_LENGTH,
+        stride: int = STRIDE,
+    ):
+        self.data = data
+        self.vocab = vocab
+        self.seq_length = seq_length
+        self.max_output_length = max_output_length
+
+        self.bos = vocab["<BOS>"]
+        self.eos = vocab["<EOS>"]
+        self.newline = vocab["<NEWLINE>"]
+
+        # (row index, split position) for every window in the corpus.
+        self.indices: list[tuple[int, int]] = []
+        for row_idx, row in enumerate(data):
+            for i in range(seq_length, len(row), stride):
+                # Skip split points with no target tokens left.
+                if i < len(row):
+                    self.indices.append((row_idx, i))
+
+    def prep_data(self, row: list[int], i: int):
+        encoder_input = [self.bos] + row[i - self.seq_length : i] + [self.eos]
+
+        # Target runs to the next newline, or the cap, whichever comes first.
+        nearest_line_end = len(row)
+        for j in range(i, len(row)):
+            if row[j] == self.newline:
+                nearest_line_end = j
+                break
+
+        end = min(i + self.max_output_length, nearest_line_end + 1)
+        labels = row[i:end]
+
+        decoder_input = [self.bos] + labels
+        decoder_output = labels + [self.eos]
+
+        return (
+            torch.tensor(encoder_input, dtype=torch.long),
+            torch.tensor(decoder_input, dtype=torch.long),
+            torch.tensor(decoder_output, dtype=torch.long),
+        )
+
+    def __getitem__(self, idx: int):
+        row_idx, i = self.indices[idx]
+        return self.prep_data(self.data[row_idx], i)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+
+def make_collate_fn(pad_idx: int):
+    """Pad a batch; targets vary in length because lines do."""
+
+    def collate_fn(batch):
+        encoder_inputs, decoder_inputs, decoder_outputs = zip(*batch)
+        return (
+            pad_sequence(encoder_inputs, batch_first=True, padding_value=pad_idx),
+            pad_sequence(decoder_inputs, batch_first=True, padding_value=pad_idx),
+            pad_sequence(decoder_outputs, batch_first=True, padding_value=pad_idx),
+        )
+
+    return collate_fn
+
+
+def build_and_cache(limit: int | None = None, artifact_dir: Path = ARTIFACT_DIR) -> None:
+    """Run the full pipeline once and cache vocab plus encoded splits."""
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Tokenizing corpus...")
+    code_tokens = load_code_tokens(limit=limit)
+    print(f"  {len(code_tokens)} functions tokenized")
+
+    train_data, valid_data, test_data = split_data(code_tokens)
+    print(f"  split: {len(train_data)} train / {len(valid_data)} valid / {len(test_data)} test")
+
+    vocab = build_vocab(train_data)
+    print(f"  vocabulary: {len(vocab)} tokens")
+
+    splits = {
+        "encoded_train": train_data,
+        "encoded_valid": valid_data,
+        "encoded_test": test_data,
+    }
+    for name, split in splits.items():
+        encoded = [encode(token_list, vocab) for token_list in split]
+        with open(artifact_dir / f"{name}.pkl", "wb") as f:
+            pickle.dump(encoded, f)
+
+    with open(artifact_dir / "vocab.pkl", "wb") as f:
+        pickle.dump(vocab, f)
+
+    print(f"Artifacts written to {artifact_dir}")
+
+
+def load_artifacts(artifact_dir: Path = ARTIFACT_DIR):
+    def read(name):
+        path = artifact_dir / f"{name}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} not found. Run 'python -m src.data.preprocess' first."
+            )
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    return (
+        read("encoded_train"),
+        read("encoded_valid"),
+        read("encoded_test"),
+        read("vocab"),
+    )
+
+
+def get_dataloaders(
+    batch_size: int = BATCH_SIZE,
+    artifact_dir: Path = ARTIFACT_DIR,
+) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, int]]:
+    """Return train, validation and test loaders plus the vocabulary."""
+    encoded_train, encoded_valid, encoded_test, vocab = load_artifacts(artifact_dir)
+
+    train_dataset = CodeCompletionDataset(encoded_train, vocab)
+    valid_dataset = CodeCompletionDataset(encoded_valid, vocab)
+    test_dataset = CodeCompletionDataset(encoded_test, vocab)
+
+    collate_fn = make_collate_fn(vocab["<PAD>"])
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+    )
+    valid_loader = DataLoader(
+        valid_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+    )
+
+    return train_loader, valid_loader, test_loader, vocab
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--limit", type=int, default=None, help="tokenize only the first N functions"
+    )
+    args = parser.parse_args()
+    build_and_cache(limit=args.limit)
